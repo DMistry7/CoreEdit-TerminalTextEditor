@@ -443,6 +443,47 @@ void editorProcessNormalKey(int c) {
         case PAGE_DOWN:
             editorMoveCursor(c);
             break;
+        case 'x': { // delete character 
+            editorMoveCursor(ARROW_RIGHT);
+            int idx = editorGetBufferIndex(E.cx, E.cy);
+            if (idx > 0) {
+                bufferMoveGap(&E.buffer, idx);
+                int target = E.buffer.data[E.buffer.gap_start - 1];
+                bufferDelete(&E.buffer);
+                editorUpdateRows();
+                if (target == '\n' && E.cy > 0) {
+                    E.cy--;
+                    E.cx = E.row[E.cy].size;
+                } else if (E.cx > 0) {
+                    E.cx--;
+                }
+                E.dirty++;
+            }
+            break;
+        }
+
+        case 'd': { // delete current line
+            if (E.num_rows == 0) break;
+            int line_len = E.row[E.cy].size;
+            int has_newline = (E.cy < E.num_rows - 1) ? 1 : 0;
+            int del_count = line_len + has_newline;
+
+            int end_cx = line_len;
+            E.cx = end_cx;
+            int idx = editorGetBufferIndex(E.cx, E.cy) + has_newline;
+            bufferMoveGap(&E.buffer, idx);
+
+            for (int i = 0; i < del_count; i++) {
+                if (E.buffer.gap_start > 0) bufferDelete(&E.buffer);
+            }
+            editorUpdateRows();
+
+            if (E.cy >= E.num_rows) E.cy = E.num_rows - 1;
+            if (E.cy < 0) E.cy = 0;
+            E.cx = 0;
+            E.dirty++;
+            break;
+        }
 
         default:
             break; // ignore other keys in normal mode
