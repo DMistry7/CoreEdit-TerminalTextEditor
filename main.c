@@ -16,6 +16,8 @@
 
 #define CORE_QUIT_TIMES 3
 
+enum EditorMode { MODE_NORMAL, MODE_INSERT };
+
 /*** Configuration Matrix ***/
 typedef struct {
     int cx, cy;          // Logical cursor row/col mapping coordinates within file
@@ -28,6 +30,7 @@ typedef struct {
     EditorRow *row;      // Matrix map array slices
     int dirty;           // State mutation tracking status bit flag
     int quit_confirm;
+    int mode;
     char *filename;      // File cache pointer identity path string
     char statusmsg[80];  // Output bottom log text block
     time_t statusmsg_time;
@@ -49,6 +52,7 @@ void editorInit(void) {
     E.row = NULL;
     E.dirty = 0;
     E.quit_confirm = CORE_QUIT_TIMES;
+    E.mode = MODE_NORMAL;
     E.filename = NULL;
     E.statusmsg[0] = '\0';
     E.statusmsg_time = 0;
@@ -297,7 +301,8 @@ void editorDrawRows(AppendBuffer *ab) {
 void editorDrawStatusBar(AppendBuffer *ab) {
     abAppend(ab, "\x1b[7m", 4); // Activate inverse color formatting
     char status[80], rstatus[80];
-    int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+    int len = snprintf(status, sizeof(status), "[%s] %.20s - %d lines %s",
+        E.mode == MODE_INSERT ? "INSERT" : "NORMAL",
         E.filename ? E.filename : "[No Name Specified]", E.num_rows,
         E.dirty ? "(modified)" : "");
     int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.num_rows);
@@ -406,11 +411,53 @@ void editorMoveCursor(int key) {
     if (E.cx > row_sz) E.cx = row_sz;
 }
 
-void editorProcessKeypress(void) {
-    int c = editorReadKey();
-
+void editorProcessNormalKey(int c) {
     switch (c) {
-        case '\r': // ENTER KEY
+        case 'i': // enter insert mode
+            E.mode = MODE_INSERT;
+            break;
+        case 'a': // append: move right one, then insert
+            editorMoveCursor(ARROW_RIGHT);
+            E.mode = MODE_INSERT;
+            break;
+        case 'h': editorMoveCursor(ARROW_LEFT);  break;
+        case 'j': editorMoveCursor(ARROW_DOWN);  break;
+        case 'k': editorMoveCursor(ARROW_UP);    break;
+        case 'l': editorMoveCursor(ARROW_RIGHT); break;
+
+        case '\x13': // Ctrl-S save
+            editorSave();
+            break;
+        case '\x06': // Ctrl-F find
+            editorFind();
+            break;
+
+        // Arrows / nav keys still work in normal mode
+        case ARROW_UP:
+        case ARROW_DOWN:
+        case ARROW_LEFT:
+        case ARROW_RIGHT:
+        case HOME_KEY:
+        case END_KEY:
+        case PAGE_UP:
+        case PAGE_DOWN:
+            editorMoveCursor(c);
+            break;
+
+        default:
+            break; // ignore other keys in normal mode
+    }
+}
+
+void editorProcessInsertKey(int c) {
+    switch (c) {
+        case '\x1b': // Esc: back to normal mode
+            E.mode = MODE_NORMAL;
+            // optional vim feel: step left when leaving insert
+            if (E.cx > 0) E.cx--;
+            break;
+
+        case '\r': // Enter: insert newline
             {
                 int current_idx = editorGetBufferIndex(E.cx, E.cy);
                 bufferMoveGap(&E.buffer, current_idx);
@@ -422,26 +469,6 @@ void editorProcessKeypress(void) {
             }
             break;
 
-        case '\x11': // CTRL-Q TO QUIT
-            if (E.dirty && E.quit_confirm > 0) {
-                editorSetStatusMessage("WARNING: unsaved changes! Press Ctrl-Q %d more time(s) to force quit.", E.quit_confirm);
-                E.quit_confirm--;
-                return;
-            }
-            write(STDOUT_FILENO, "\x1b[2J", 4);
-            write(STDOUT_FILENO, "\x1b[H", 3);
-            editorCleanup();
-            exit(0);
-            break;
-
-        case '\x13': // CTRL-S TO SAVE
-            editorSave();
-            break;
-
-        case '\x06': // CTRL-F TO SEARCH
-            editorFind();
-            break;
-
         case BACKSPACE:
         case DEL_KEY:
             {
@@ -451,8 +478,6 @@ void editorProcessKeypress(void) {
                 int current_idx = editorGetBufferIndex(E.cx, E.cy);
                 if (current_idx > 0) {
                     bufferMoveGap(&E.buffer, current_idx);
-                    
-                    // Track if we are deleting an active newline mapping
                     int target_char = E.buffer.data[E.buffer.gap_start - 1];
                     bufferDelete(&E.buffer);
                     editorUpdateRows();
@@ -489,7 +514,31 @@ void editorProcessKeypress(void) {
             }
             break;
     }
+}
 
+void editorProcessKeypress(void) {
+    int c = editorReadKey();
+
+    if (c == '\x11') {
+        if (E.dirty && E.quit_confirm > 0) {
+            editorSetStatusMessage(
+                "WARNING: unsaved changes! Press Ctrl-Q %d more time(s) to force quit.",
+                E.quit_confirm);
+            E.quit_confirm--;
+            return;
+        }
+        write(STDOUT_FILENO, "\x1b[2J", 4);
+        write(STDOUT_FILENO, "\x1b[H", 3);
+        editorCleanup();
+        exit(0);
+    }
+
+    if (E.mode == MODE_NORMAL) {
+        editorProcessNormalKey(c);
+    } else {
+        editorProcessInsertKey(c);
+    }
+    
     if (c != '\x11') E.quit_confirm = CORE_QUIT_TIMES;
 }
 
