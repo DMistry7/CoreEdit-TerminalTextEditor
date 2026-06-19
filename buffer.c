@@ -18,6 +18,7 @@ static void bufferResize(GapBuffer *gb, int new_capacity) {
     int old_capacity = gb->capacity;
     int right_size = old_capacity - 1 - gb->gap_end;
     char *new_data = malloc(new_capacity);
+    if (new_data == NULL) return;
     
     memcpy(new_data, gb->data, gb->gap_start);
     int new_gap_end = new_capacity - 1 - right_size;
@@ -40,10 +41,12 @@ void bufferMoveGap(GapBuffer *gb, int target_position) {
 
     while (gb->gap_start > target_position) {
         gb->gap_start--;
+        gb->data[gb->gap_end] = gb->data[gb->gap_start];
         gb->gap_end--;
-        gb->data[gb->gap_end + 1] = gb->data[gb->gap_start];
     }
     while (gb->gap_start < target_position) {
+        int right_size = gb->capacity - 1 - gb->gap_end;
+        if (right_size <= 0) break;
         gb->data[gb->gap_start] = gb->data[gb->gap_end + 1];
         gb->gap_start++;
         gb->gap_end++;
