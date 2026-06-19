@@ -12,11 +12,14 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <time.h>
+#include <errno.h>
+
+#define CORE_QUIT_TIMES 3
 
 /*** Configuration Matrix ***/
 typedef struct {
     int cx, cy;          // Logical cursor row/col mapping coordinates within file
-    int rx, ry;          // Actual render transformations (tab expansion variants)
+    int rx;          // Actual render transformations (tab expansion variants)
     int row_offset;      // Vertical viewport scrolling index tracker
     int col_offset;      // Horizontal viewport scrolling index tracker
     int screen_rows;     // Output terminal height boundary configuration
@@ -24,6 +27,7 @@ typedef struct {
     int num_rows;        // Total logical structural row indexes tracked
     EditorRow *row;      // Matrix map array slices
     int dirty;           // State mutation tracking status bit flag
+    int quit_confirm;
     char *filename;      // File cache pointer identity path string
     char statusmsg[80];  // Output bottom log text block
     time_t statusmsg_time;
@@ -34,14 +38,17 @@ EditorConfig E;
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorUpdateRows(void);
+void editorScroll(void);
+void editorRefreshScreen(void);
 
 /*** System Architecture Allocations & Lifecycles ***/
 void editorInit(void) {
-    E.cx = 0; E.cy = 0; E.rx = 0; E.ry = 0;
+    E.cx = 0; E.cy = 0; E.rx = 0;
     E.row_offset = 0; E.col_offset = 0;
     E.num_rows = 0;
     E.row = NULL;
     E.dirty = 0;
+    E.quit_confirm = CORE_QUIT_TIMES;
     E.filename = NULL;
     E.statusmsg[0] = '\0';
     E.statusmsg_time = 0;
@@ -136,7 +143,7 @@ void editorOpen(char *filename) {
 
 void editorSave(void) {
     if (E.filename == NULL) {
-        E.filename = "untitled.txt";
+        E.filename = strdup("untitled.txt");
     }
 
     int len;
@@ -145,7 +152,7 @@ void editorSave(void) {
 
     FILE *fp = fopen(E.filename, "w+");
     if (fp != NULL) {
-        if (fwrite(buf, 1, len, fp) == len) {
+        if (fwrite(buf, 1, len, fp) == (size_t)len) {
             fclose(fp);
             free(buf);
             E.dirty = 0;
@@ -171,15 +178,11 @@ void editorFindCallback(char *query, int key) {
 
     if (key == ARROW_DOWN || key == ARROW_RIGHT) direction = 1;
     else if (key == ARROW_UP || key == ARROW_LEFT) direction = -1;
-    else {
-        last_match = -1;
-        direction = 1;
-    }
+    else direction = 1;
 
     if (query[0] == '\0') return;
+    if (E.num_rows == 0) return;
 
-    int total_len = 0;
-    char *flat = bufferToString(&E.buffer, &total_len);
     int current_match = last_match;
 
     // Scan through structural text blocks
@@ -191,11 +194,9 @@ void editorFindCallback(char *query, int key) {
             last_match = current_match;
             E.cy = current_match;
             E.cx = match - row->chars;
-            E.row_offset = E.cy; // Instantly center viewport to frame target
             break;
         }
     }
-    free(flat);
 }
 
 void editorFind(void) {
@@ -210,14 +211,13 @@ void editorFind(void) {
     while (1) {
         editorSetStatusMessage("Search Term: %s (ESC to cancel | Enter to submit)", query);
         // Refresh terminal screen with current text and updated status messages
-        void editorScroll(void);
-        void editorRefreshScreen(void);
         editorScroll();
         editorRefreshScreen();
 
         int c = editorReadKey();
         if (c == DEL_KEY || c == BACKSPACE) {
             if (query_len > 0) query[--query_len] = '\0';
+            editorFindCallback(query, c);
         } else if (c == '\x1b') {
             editorSetStatusMessage("");
             E.cx = saved_cx; E.cy = saved_cy;
@@ -228,13 +228,16 @@ void editorFind(void) {
             editorSetStatusMessage("");
             editorFindCallback(query, c);
             return;
-        } else if (c != '\0' && c < 1000) {
+        } else if (c == ARROW_UP || c == ARROW_DOWN ||
+                   c == ARROW_LEFT || c == ARROW_RIGHT) {
+            editorFindCallback(query, c);
+        } else if (c != '\0' && c < 128) {
             if (query_len < (int)sizeof(query) - 1) {
-                query[query_len++] = c;
+                query[query_len++] = (char)c;
                 query[query_len] = '\0';
             }
+            editorFindCallback(query, c);
         }
-        editorFindCallback(query, c);
     }
 }
 
@@ -412,6 +415,7 @@ void editorProcessKeypress(void) {
                 int current_idx = editorGetBufferIndex(E.cx, E.cy);
                 bufferMoveGap(&E.buffer, current_idx);
                 bufferInsert(&E.buffer, '\n');
+                editorUpdateRows();
                 E.cy++;
                 E.cx = 0;
                 E.dirty++;
@@ -419,16 +423,10 @@ void editorProcessKeypress(void) {
             break;
 
         case '\x11': // CTRL-Q TO QUIT
-            if (E.dirty) {
-                editorSetStatusMessage("WARNING: File has unsaved modifications! Press Ctrl-Q 2 more times to override and force quit.");
-                static int quit_confirmations = 2;
-                if (--quit_confirmations == 0) {
-                    write(STDOUT_FILENO, "\x1b[2J", 4);
-                    write(STDOUT_FILENO, "\x1b[H", 3);
-                    editorCleanup();
-                    exit(0);
-                }
-                break;
+            if (E.dirty && E.quit_confirm > 0) {
+                editorSetStatusMessage("WARNING: unsaved changes! Press Ctrl-Q %d more time(s) to force quit.", E.quit_confirm);
+                E.quit_confirm--;
+                return;
             }
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
@@ -447,26 +445,21 @@ void editorProcessKeypress(void) {
         case BACKSPACE:
         case DEL_KEY:
             {
-                int current_idx = editorGetBufferIndex(E.cx, E.cy);
                 if (c == DEL_KEY) {
-                    // Turn Delete into Backspace relative to index translation shifts
-                    current_idx++;
-                    if (current_idx > bufferGetTotalSize(&E.buffer)) break;
-                    E.cx++;
+                    editorMoveCursor(ARROW_RIGHT);
                 }
-                
+                int current_idx = editorGetBufferIndex(E.cx, E.cy);
                 if (current_idx > 0) {
                     bufferMoveGap(&E.buffer, current_idx);
                     
                     // Track if we are deleting an active newline mapping
                     int target_char = E.buffer.data[E.buffer.gap_start - 1];
                     bufferDelete(&E.buffer);
-                    
-                    if (target_char == '\n') {
-                        editorUpdateRows();
+                    editorUpdateRows();
+                    if (target_char == '\n' && E.cy > 0) {
                         E.cy--;
                         E.cx = E.row[E.cy].size;
-                    } else {
+                    } else if (E.cx > 0) {
                         E.cx--;
                     }
                     E.dirty++;
@@ -486,15 +479,18 @@ void editorProcessKeypress(void) {
             break;
 
         default:
-            if (c != '\0' && c < 1000) {
+            if (c != '\0' && c < 128) {
                 int current_idx = editorGetBufferIndex(E.cx, E.cy);
                 bufferMoveGap(&E.buffer, current_idx);
                 bufferInsert(&E.buffer, c);
+                editorUpdateRows();
                 E.cx++;
                 E.dirty++;
             }
             break;
     }
+
+    if (c != '\x11') E.quit_confirm = CORE_QUIT_TIMES;
 }
 
 /*** Orchestration Layer Execution Pipeline ***/
